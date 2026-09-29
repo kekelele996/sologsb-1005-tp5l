@@ -78,3 +78,71 @@ export interface ValidationIssue {
   title: string
   detail: string
 }
+
+/** 一轮已完成修改的摘要，用于重开时还原“最后哪轮真的存下来了”。 */
+export interface JournalAction {
+  id: string
+  at: string
+  label: string
+}
+
+/**
+ * 写前恢复点：主数据写入前落盘。
+ * before 为上一轮已确认完好的状态，next 为这轮修改后的状态；
+ * nextPast / nextFuture 为这轮之后的撤销、重做栈，放弃时按 kind 反推旧栈。
+ */
+export interface JournalEntry {
+  id: string
+  at: string
+  kind: 'commit' | 'undo' | 'redo' | 'snapshot'
+  action: string
+  before: WorkbenchState
+  next: WorkbenchState
+  nextPast: WorkbenchState[]
+  nextFuture: WorkbenchState[]
+  recent: JournalAction[]
+}
+
+/** 恢复日志文件；同一时刻至多有一条未闭合的恢复点。 */
+export interface RecoveryJournal {
+  schema: 1
+  open: JournalEntry | null
+}
+
+/** 主数据信封：状态与撤销/重做栈一起落盘。journalId 非空表示信封对应一个未闭合恢复点。 */
+export interface PersistedEnvelope {
+  schema: 2
+  journalId: string
+  state: WorkbenchState
+  past: WorkbenchState[]
+  future: WorkbenchState[]
+  recent: JournalAction[]
+  savedAt: string
+}
+
+export interface RecoverySummary {
+  claimCount: number
+  featureCount: number
+  mappingCount: number
+  annotationCount: number
+  versionCount: number
+}
+
+/** 重开时发现中断保存，等待代理人决定恢复或放弃。 */
+export interface PendingRecovery {
+  /** interrupted：日志之后主数据未写完或未确认；damaged：主数据已写坏并被隔离 */
+  reason: 'interrupted' | 'damaged'
+  action: string
+  journalAt: string
+  savedAt: string | null
+  before: WorkbenchState
+  next: WorkbenchState
+  recent: JournalAction[]
+}
+
+export interface QuarantineItem {
+  key: string
+  at: string
+  reason: string
+  payload: string | null
+}

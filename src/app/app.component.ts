@@ -10,7 +10,7 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, Feature, PendingRecovery, QuarantineItem, RecoverySummary, Role, ValidationIssue, WorkbenchState } from './models'
 import { WorkbenchService } from './workbench.service'
 
 @Component({
@@ -30,6 +30,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   versionDialog = false
   versionName = ''
   activeIssue: ValidationIssue | null = null
+  pendingRecovery: PendingRecovery | null = null
+  recoveryBefore: RecoverySummary | null = null
+  recoveryNext: RecoverySummary | null = null
+  saveError: string | null = null
+  savedAt: string | null = null
+  quarantineItems: QuarantineItem[] = []
   roleOptions: Array<{ label: string; value: Role }> = [
     { label: '代理人（可编辑主数据与本人批注）', value: 'author' },
     { label: '审查员（可编辑本人批注）', value: 'examiner' },
@@ -48,6 +54,17 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }))
     this.subscriptions.add(this.service.issues$.subscribe(issues => this.issues = issues))
     this.subscriptions.add(this.service.history$.subscribe(history => this.history = history))
+    this.subscriptions.add(this.service.pendingRecovery$.subscribe(pending => {
+      this.pendingRecovery = pending
+      if (pending) {
+        const comparison = this.service.compareRecovery(pending)
+        this.recoveryBefore = comparison.before
+        this.recoveryNext = comparison.next
+        this.quarantineItems = this.service.listQuarantine()
+      }
+    }))
+    this.subscriptions.add(this.service.saveError$.subscribe(error => { this.saveError = error }))
+    this.subscriptions.add(this.service.savedAt$.subscribe(at => { this.savedAt = at }))
     window.addEventListener('keydown', this.handleKeyboard)
   }
 
@@ -122,6 +139,48 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     this.service.restoreVersion(id)
   }
 
+  acceptRecovery(): void { this.service.resolveRecovery('accept') }
+  discardRecovery(): void { this.service.resolveRecovery('discard') }
+  retrySave(): void { this.service.retrySave() }
+
+  get recoveryRecent(): Array<{ at: string; label: string }> {
+    return (this.pendingRecovery?.recent || []).slice(0, 8).map(item => ({ at: item.at, label: item.label }))
+  }
+
+  get recoveryDiffRows(): Array<{ label: string; before: number; next: number; changed: boolean }> {
+    if (!this.recoveryBefore || !this.recoveryNext) return []
+    const rows: Array<{ label: string; before: number; next: number }> = [
+      { label: '权利要求', before: this.recoveryBefore.claimCount, next: this.recoveryNext.claimCount },
+      { label: '技术特征', before: this.recoveryBefore.featureCount, next: this.recoveryNext.featureCount },
+      { label: '特征映射（支持段落关系）', before: this.recoveryBefore.mappingCount, next: this.recoveryNext.mappingCount },
+      { label: '批注', before: this.recoveryBefore.annotationCount, next: this.recoveryNext.annotationCount },
+      { label: '保存的版本', before: this.recoveryBefore.versionCount, next: this.recoveryNext.versionCount }
+    ]
+    return rows.map(row => ({ ...row, changed: row.before !== row.next }))
+  }
+
+  get savedAtLabel(): string {
+    if (!this.savedAt) return '尚未确认保存'
+    return `上次确认保存 ${new Date(this.savedAt).toLocaleString('zh-CN', { hour12: false })}`
+  }
+
+  downloadQuarantine(item: QuarantineItem): void {
+    const payload = this.service.quarantinePayload(item.key)
+    if (payload === null) return
+    const blob = new Blob([payload], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `损坏数据-${item.at.replace(/[:.]/g, '-')}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  clearQuarantine(item: QuarantineItem): void {
+    this.service.removeQuarantine(item.key)
+    this.quarantineItems = this.service.listQuarantine()
+  }
+
   getVersion(id: string) { return this.state.versions.find(item => item.id === id) }
   compareRows(): Array<{ label: string; before: string; after: string; changed: boolean }> {
     const a = this.getVersion(this.compareA)
@@ -161,6 +220,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   private handleKeyboard = (event: KeyboardEvent): void => {
     if (!(event.metaKey || event.ctrlKey)) return
+    if (this.pendingRecovery && ['z', 'y', 's'].includes(event.key.toLowerCase())) {
+      event.preventDefault()
+      return
+    }
     if (event.key.toLowerCase() === 'z') {
       event.preventDefault()
       event.shiftKey ? this.service.redo() : this.service.undo()

@@ -6,12 +6,24 @@
       <div><strong>权利要求映射工作台</strong><small>Claim-to-Spec Traceability</small></div>
     </div>
     <div class="top-actions">
-      <span class="save-state">浏览器本地自动保存</span>
-      <p-button label="撤销" icon="pi pi-undo" severity="secondary" [outlined]="true" [disabled]="!history.past" (onClick)="service.undo()" pTooltip="Ctrl / ⌘ + Z"></p-button>
-      <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" [disabled]="!history.future" (onClick)="service.redo()" pTooltip="Ctrl / ⌘ + Shift + Z"></p-button>
-      <p-button label="保存版本" icon="pi pi-save" (onClick)="versionDialog = true" pTooltip="Ctrl / ⌘ + S"></p-button>
+      <span class="save-state" [class.dirty]="!!saveError" [attr.title]="savedAtLabel">
+        <i class="pi" [class.pi-check-circle]="!saveError" [class.pi-exclamation-triangle]="!!saveError"></i>
+        {{ saveError ? '本地保存失败' : savedAtLabel }}
+      </span>
+      <p-button label="撤销" icon="pi pi-undo" severity="secondary" [outlined]="true" [disabled]="!history.past || !!pendingRecovery" (onClick)="service.undo()" pTooltip="Ctrl / ⌘ + Z"></p-button>
+      <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" [disabled]="!history.future || !!pendingRecovery" (onClick)="service.redo()" pTooltip="Ctrl / ⌘ + Shift + Z"></p-button>
+      <p-button label="保存版本" icon="pi pi-save" [disabled]="!!pendingRecovery" (onClick)="versionDialog = true" pTooltip="Ctrl / ⌘ + S"></p-button>
     </div>
   </header>
+
+  <div class="save-error-banner" *ngIf="saveError" role="alert">
+    <i class="pi pi-exclamation-triangle"></i>
+    <div>
+      <strong>{{ saveError }}</strong>
+      <small>编辑内容仍保留在当前页面中，恢复点已先落盘；请清理浏览器存储空间后立即补存，不要直接关闭页面。</small>
+    </div>
+    <p-button label="重试保存" icon="pi pi-refresh" size="small" (onClick)="retrySave()"></p-button>
+  </div>
 
   <main id="workbench" class="workbench">
     <aside class="case-sidebar">
@@ -49,7 +61,7 @@
     <section class="main-panel" *ngIf="selectedClaim as claim">
       <div class="page-heading">
         <div><span class="eyebrow">案件 CN-2026-0917</span><h1>{{ claim.title }}</h1><p>独立项与从属项在同一视图中完成拆解、引用和支持映射。</p></div>
-        <div class="status-stack"><span class="status-chip ready">本地草稿</span><span class="updated">所有编辑实时持久化</span></div>
+        <div class="status-stack"><span class="status-chip ready">本地草稿</span><span class="updated">每轮修改先写恢复点再落盘，崩溃可找回</span></div>
       </div>
 
       <nav class="tabs" aria-label="工作台视图">
@@ -253,4 +265,56 @@
     <p>{{ issue.detail }}</p>
   </div>
   <ng-template pTemplate="footer"><p-button label="关闭" (onClick)="closeIssue()" /></ng-template>
+</p-dialog>
+
+<p-dialog header="发现上次未完成的保存" [visible]="!!pendingRecovery" [modal]="true" [closable]="false" [closeOnEscape]="false" [dismissableMask]="false" [style]="{ width: '640px' }">
+  <div class="dialog-body recovery-dialog" *ngIf="pendingRecovery as pending">
+    <div class="recovery-alert" [class.damaged]="pending.reason === 'damaged'">
+      <i class="pi" [class.pi-database]="pending.reason === 'damaged'" [class.pi-history]="pending.reason === 'interrupted'"></i>
+      <div>
+        <strong>{{ pending.reason === 'damaged' ? '主数据文件已损坏，已自动隔离，案件没有丢失' : '浏览器在自动保存过程中被关闭' }}</strong>
+        <p>
+          中断轮次：<b>{{ pending.action }}</b> · {{ pending.journalAt | date:'yyyy-MM-dd HH:mm:ss' }}
+          <ng-container *ngIf="pending.savedAt">；上次确认完好的保存：{{ pending.savedAt | date:'yyyy-MM-dd HH:mm:ss' }}</ng-container>
+        </p>
+      </div>
+    </div>
+
+    <p class="recovery-lead">下方是中断前进度相对上次完好保存将找回的内容，请选择找回，或放弃该轮回到上次完好状态。两份数据都已留在本地恢复点中。</p>
+
+    <table class="recovery-table">
+      <thead><tr><th>内容</th><th>上次完好保存</th><th>中断前进度</th><th>变化</th></tr></thead>
+      <tbody>
+        <tr *ngFor="let row of recoveryDiffRows" [class.changed]="row.changed">
+          <td>{{ row.label }}</td>
+          <td>{{ row.before }}</td>
+          <td><strong>{{ row.next }}</strong></td>
+          <td><span class="delta" *ngIf="row.changed" [class.up]="row.next > row.before" [class.down]="row.next < row.before">{{ row.next > row.before ? '+' : '' }}{{ row.next - row.before }}</span><span *ngIf="!row.changed" class="delta-same">—</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="recovery-rounds" *ngIf="recoveryRecent.length">
+      <strong>中断前的最近修改轮次</strong>
+      <ol>
+        <li *ngFor="let item of recoveryRecent"><time>{{ item.at | date:'MM-dd HH:mm:ss' }}</time><span>{{ item.label }}</span></li>
+      </ol>
+    </div>
+
+    <div class="quarantine-box" *ngIf="quarantineItems.length">
+      <strong>已隔离的损坏数据文件（{{ quarantineItems.length }}）</strong>
+      <p>损坏原文不会被覆盖，可导出交给技术支持核对；导出并确认后可清除。</p>
+      <div class="quarantine-row" *ngFor="let item of quarantineItems">
+        <span><i class="pi pi-file"></i>{{ item.reason }}<small>{{ item.at | date:'yyyy-MM-dd HH:mm:ss' }}</small></span>
+        <span class="quarantine-actions">
+          <p-button label="导出原文" icon="pi pi-download" [text]="true" size="small" (onClick)="downloadQuarantine(item)" />
+          <p-button label="清除" icon="pi pi-trash" severity="danger" [text]="true" size="small" (onClick)="clearQuarantine(item)" />
+        </span>
+      </div>
+    </div>
+  </div>
+  <ng-template pTemplate="footer">
+    <p-button label="放弃该轮，使用上次完好数据" icon="pi pi-undo" severity="secondary" [outlined]="true" (onClick)="discardRecovery()" />
+    <p-button label="找回中断前进度" icon="pi pi-history" (onClick)="acceptRecovery()" pTooltip="恢复后撤销/重做从该轮之后继续" />
+  </ng-template>
 </p-dialog>

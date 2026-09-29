@@ -1,9 +1,10 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, ClaimVersion, Feature, JournalAction, Paragraph, PendingRecovery, Position, QuarantineItem, Role, ValidationIssue, WorkbenchState } from './models'
+import { RecoveryStore, StorageWriteError, summarize } from './recovery-store'
 
-const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
+const MAX_HISTORY = 60
 
 const initialClaims: Claim[] = [
   { id: 'claim-1', number: 1, title: '一种自适应展柜环境控制装置', independent: true, text: '一种自适应展柜环境控制装置，包括：柜体；环境传感模块，设置于所述柜体内并用于采集温湿度数据；以及控制模块，与所述环境传感模块通信，并根据所述温湿度数据调节所述柜体的微环境。' },
@@ -37,17 +38,26 @@ function demoState(): WorkbenchState {
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+function sameState(a: WorkbenchState, b: WorkbenchState): boolean { return JSON.stringify(a) === JSON.stringify(b) }
 
 @Injectable({ providedIn: 'root' })
 export class WorkbenchService implements OnDestroy {
-  private readonly initialState = this.loadState()
-  private readonly stateSubject = new BehaviorSubject<WorkbenchState>(this.initialState)
+  private readonly store = new RecoveryStore()
+  private readonly booted = this.store.boot(demoState())
+  private readonly stateSubject = new BehaviorSubject<WorkbenchState>(this.booted.state)
   private readonly historySubject = new BehaviorSubject<{ past: number; future: number }>({ past: 0, future: 0 })
-  private past: WorkbenchState[] = []
-  private future: WorkbenchState[] = []
+  private readonly pendingRecoverySubject = new BehaviorSubject<PendingRecovery | null>(this.booted.pending)
+  private readonly saveErrorSubject = new BehaviorSubject<string | null>(null)
+  private readonly savedAtSubject = new BehaviorSubject<string | null>(this.booted.savedAt)
+  private past: WorkbenchState[] = this.booted.past
+  private future: WorkbenchState[] = this.booted.future
+  private recent: JournalAction[] = this.booted.recent
 
   readonly state$ = this.stateSubject.asObservable()
   readonly history$ = this.historySubject.asObservable()
+  readonly pendingRecovery$: Observable<PendingRecovery | null> = this.pendingRecoverySubject.asObservable()
+  readonly saveError$ = this.saveErrorSubject.asObservable()
+  readonly savedAt$ = this.savedAtSubject.asObservable()
   readonly claims$ = this.state$.pipe(map(state => state.claims))
   readonly paragraphs$ = this.state$.pipe(map(state => state.paragraphs))
   readonly features$ = this.state$.pipe(map(state => state.features))
@@ -57,17 +67,24 @@ export class WorkbenchService implements OnDestroy {
   readonly selectedFeature$ = this.state$.pipe(map(state => state.features.find(feature => feature.id === state.selectedFeatureId) || null))
   readonly issues$ = this.state$.pipe(map(state => this.validate(state)))
 
+  private readonly beforeUnloadHandler = (): void => {
+    this.savePosition()
+    if (this.saveErrorSubject.value) this.retrySave()
+  }
+
   constructor() {
-    if (typeof window !== 'undefined') window.addEventListener('beforeunload', () => this.savePosition())
+    this.updateHistory()
+    if (typeof window !== 'undefined') window.addEventListener('beforeunload', this.beforeUnloadHandler)
   }
 
   ngOnDestroy(): void {
-    if (typeof window !== 'undefined') window.removeEventListener('beforeunload', () => this.savePosition())
+    if (typeof window !== 'undefined') window.removeEventListener('beforeunload', this.beforeUnloadHandler)
   }
 
   get snapshot(): WorkbenchState { return clone(this.stateSubject.value) }
   get canUndo(): boolean { return this.past.length > 0 }
   get canRedo(): boolean { return this.future.length > 0 }
+  get pendingRecovery(): PendingRecovery | null { return this.pendingRecoverySubject.value }
 
   selectClaim(id: string): void {
     this.patchState(state => { state.selectedClaimId = id; state.selectedFeatureId = state.features.find(feature => feature.claimId === id)?.id || null })
@@ -89,14 +106,14 @@ export class WorkbenchService implements OnDestroy {
   }
 
   updateClaim(patch: Partial<Claim>): void {
-    this.commit(state => {
+    this.commit('编辑权利要求正文', state => {
       const claim = state.claims.find(item => item.id === state.selectedClaimId)
       if (claim) Object.assign(claim, patch)
     })
   }
 
   addClaim(): void {
-    this.commit(state => {
+    this.commit('录入新权利要求', state => {
       const number = Math.max(0, ...state.claims.map(claim => claim.number)) + 1
       const claim: Claim = { id: `claim-${Date.now()}`, number, title: `权利要求 ${number}`, independent: false, text: '请录入权利要求正文。' }
       state.claims.push(claim)
@@ -107,7 +124,7 @@ export class WorkbenchService implements OnDestroy {
 
   addParagraph(): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('新增说明书段落', state => {
       const next = state.paragraphs.length + 1
       state.paragraphs.push({ id: `para-${Date.now()}`, section: `说明书 [${String(next * 5).padStart(4, '0')}]`, text: '' })
     })
@@ -115,7 +132,7 @@ export class WorkbenchService implements OnDestroy {
 
   updateParagraph(id: string, patch: Partial<Paragraph>): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('编辑说明书段落', state => {
       const paragraph = state.paragraphs.find(item => item.id === id)
       if (paragraph) Object.assign(paragraph, patch)
     })
@@ -123,7 +140,7 @@ export class WorkbenchService implements OnDestroy {
 
   deleteParagraph(id: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('删除说明书段落', state => {
       state.paragraphs = state.paragraphs.filter(item => item.id !== id)
       state.features.forEach(feature => { feature.supportIds = feature.supportIds.filter(paragraphId => paragraphId !== id) })
       state.orphanMappings = state.orphanMappings.filter(item => item.paragraphId !== id)
@@ -132,7 +149,7 @@ export class WorkbenchService implements OnDestroy {
 
   addFeature(): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('新增技术特征', state => {
       const feature: Feature = {
         id: `feature-${Date.now()}`, claimId: state.selectedClaimId,
         label: `新特征 ${state.features.filter(item => item.claimId === state.selectedClaimId).length + 1}`,
@@ -145,7 +162,7 @@ export class WorkbenchService implements OnDestroy {
 
   updateFeature(id: string, patch: Partial<Feature>): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('编辑技术特征', state => {
       const feature = state.features.find(item => item.id === id)
       if (feature) Object.assign(feature, patch)
     })
@@ -153,7 +170,7 @@ export class WorkbenchService implements OnDestroy {
 
   deleteFeature(id: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('删除技术特征', state => {
       const feature = state.features.find(item => item.id === id)
       if (!feature) return
       feature.supportIds.forEach(paragraphId => state.orphanMappings.push({
@@ -172,7 +189,7 @@ export class WorkbenchService implements OnDestroy {
 
   toggleParagraphMapping(featureId: string, paragraphId: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('调整特征支持映射', state => {
       const feature = state.features.find(item => item.id === featureId)
       if (!feature) return
       const index = feature.supportIds.indexOf(paragraphId)
@@ -183,7 +200,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   clearOrphan(id: string): void {
-    this.commit(state => { state.orphanMappings = state.orphanMappings.filter(item => item.id !== id) })
+    this.commit('清理遗留映射', state => { state.orphanMappings = state.orphanMappings.filter(item => item.id !== id) })
   }
 
   addAnnotation(featureId: string, text: string): void {
@@ -191,27 +208,27 @@ export class WorkbenchService implements OnDestroy {
     if (!trimmed) return
     const role = this.stateSubject.value.role
     const names: Record<Role, string> = { author: '代理人 · 陈昊', examiner: '审查员 · 李岚', viewer: '观察者' }
-    this.commit(state => state.annotations.push({
+    this.commit('新增批注', state => state.annotations.push({
       id: `annotation-${Date.now()}`, featureId, authorRole: role, authorName: names[role], text: trimmed, updatedAt: new Date().toISOString()
     }))
   }
 
   updateAnnotation(id: string, text: string): void {
-    this.commit(state => {
+    this.commit('编辑批注', state => {
       const annotation = state.annotations.find(item => item.id === id)
       if (annotation && annotation.authorRole === state.role) annotation.text = text
     })
   }
 
   deleteAnnotation(id: string): void {
-    this.commit(state => {
+    this.commit('删除批注', state => {
       const annotation = state.annotations.find(item => item.id === id)
       if (annotation && annotation.authorRole === state.role) state.annotations = state.annotations.filter(item => item.id !== id)
     })
   }
 
   createVersion(name?: string): void {
-    this.commit(state => {
+    this.commit('保存版本快照', state => {
       state.versions.unshift({
         id: `version-${Date.now()}`, name: name?.trim() || `快照 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
         createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features)
@@ -220,7 +237,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   restoreVersion(id: string): void {
-    this.commit(state => {
+    this.commit('恢复历史版本', state => {
       const version = state.versions.find(item => item.id === id)
       if (!version) return
       state.claims = clone(version.claims)
@@ -231,34 +248,98 @@ export class WorkbenchService implements OnDestroy {
   }
 
   undo(): void {
-    const previous = this.past.pop()
+    const previous = this.past[this.past.length - 1]
     if (!previous) return
-    this.future.push(clone(this.stateSubject.value))
-    this.stateSubject.next(previous)
-    this.updateHistory()
-    this.saveState()
+    const current = clone(this.stateSubject.value)
+    const label = this.recent[0]?.label ? `撤销：${this.recent[0].label}` : '撤销上一轮操作'
+    const nextPast = this.past.slice(0, -1)
+    const nextFuture = [...this.future, current]
+    this.runCheckpoint('undo', label, current, previous, nextPast, nextFuture)
   }
 
   redo(): void {
-    const next = this.future.pop()
+    const next = this.future[this.future.length - 1]
     if (!next) return
-    this.past.push(clone(this.stateSubject.value))
-    this.stateSubject.next(next)
-    this.updateHistory()
-    this.saveState()
+    const current = clone(this.stateSubject.value)
+    const label = this.recent[0]?.label ? `重做：${this.recent[0].label}` : '重做上一轮操作'
+    const nextPast = [...this.past, current]
+    const nextFuture = this.future.slice(0, -1)
+    this.runCheckpoint('redo', label, current, next, nextPast, nextFuture)
+  }
+
+  /** 重开时对未闭合恢复点作出决定：找回崩溃前进度，或放弃并回到上次完好状态。 */
+  resolveRecovery(mode: 'accept' | 'discard'): void {
+    const pending = this.pendingRecoverySubject.value
+    if (!pending) return
+    const resolution: JournalAction = {
+      id: `action-${mode}-${Date.now()}`,
+      at: new Date().toISOString(),
+      label: mode === 'accept' ? `找回中断前进度：${pending.action}` : `放弃中断轮次：${pending.action}`
+    }
+    try {
+      const recent = [resolution, ...(mode === 'accept' ? pending.recent : this.recent)].slice(0, 20)
+      const envelope = mode === 'accept'
+        ? this.store.accept(pending, recent)
+        : this.store.discard(pending, recent)
+      this.past = envelope.past
+      this.future = envelope.future
+      this.recent = envelope.recent
+      this.stateSubject.next(clone(envelope.state))
+      this.savedAtSubject.next(envelope.savedAt)
+      this.saveErrorSubject.next(null)
+      this.pendingRecoverySubject.next(null)
+      this.updateHistory()
+    } catch (error) {
+      this.saveErrorSubject.next(this.describeError(error))
+    }
+  }
+
+  /** 保存失败（如配额不足）后手动补存；恢复点协议保证不会产生半截数据。 */
+  retrySave(): void {
+    if (!this.saveErrorSubject.value || this.pendingRecoverySubject.value) return
+    try {
+      const envelope = this.store.snapshot(
+        this.stateSubject.value,
+        this.past.slice(-20),
+        this.future.slice(-20),
+        this.recent,
+        '补存尚未落盘的修改'
+      )
+      this.savedAtSubject.next(envelope.savedAt)
+      this.saveErrorSubject.next(null)
+    } catch (error) {
+      this.saveErrorSubject.next(this.describeError(error))
+    }
+  }
+
+  listQuarantine(): QuarantineItem[] { return this.store.listQuarantine() }
+  quarantinePayload(key: string): string | null { return this.store.getQuarantinePayload(key) }
+  removeQuarantine(key: string): void { this.store.removeQuarantine(key) }
+
+  /** 恢复弹窗中对比两份状态将找回的内容数量。 */
+  compareRecovery(pending: PendingRecovery): { before: ReturnType<typeof summarize>; next: ReturnType<typeof summarize> } {
+    return { before: summarize(pending.before), next: summarize(pending.next) }
   }
 
   savePosition(): void {
     if (typeof localStorage === 'undefined') return
     const state = this.stateSubject.value
     const position: Position = { tab: state.activeTab, claimId: state.selectedClaimId, featureId: state.selectedFeatureId, scrollY: window.scrollY }
-    localStorage.setItem(POSITION_KEY, JSON.stringify(position))
-    this.saveState()
+    try { localStorage.setItem(POSITION_KEY, JSON.stringify(position)) } catch { /* 位置丢失不影响案件数据 */ }
   }
 
   readPosition(): Position {
-    if (typeof localStorage === 'undefined') return { tab: this.initialState.activeTab, claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 }
-    try { return { ...JSON.parse(localStorage.getItem(POSITION_KEY) || '{}'), ...this.stateSubject.value } } catch { return { tab: 'mapping', claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 } }
+    const fallback: Position = { tab: this.stateSubject.value.activeTab, claimId: this.stateSubject.value.selectedClaimId, featureId: this.stateSubject.value.selectedFeatureId, scrollY: 0 }
+    if (typeof localStorage === 'undefined') return fallback
+    try {
+      const stored = JSON.parse(localStorage.getItem(POSITION_KEY) || '{}')
+      return {
+        tab: typeof stored.tab === 'string' ? stored.tab : fallback.tab,
+        claimId: typeof stored.claimId === 'string' ? stored.claimId : fallback.claimId,
+        featureId: typeof stored.featureId === 'string' ? stored.featureId : fallback.featureId,
+        scrollY: typeof stored.scrollY === 'number' ? stored.scrollY : 0
+      }
+    } catch { return fallback }
   }
 
   exportJson(): string { return JSON.stringify({ ...this.snapshot, validationIssues: this.validate(this.stateSubject.value) }, null, 2) }
@@ -273,7 +354,7 @@ export class WorkbenchService implements OnDestroy {
     ])
     const csv = [['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落'], ...rows]
       .map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n')
-    return `\uFEFF${csv}`
+    return `﻿${csv}`
   }
 
   validate(state = this.stateSubject.value): ValidationIssue[] {
@@ -301,32 +382,77 @@ export class WorkbenchService implements OnDestroy {
     return visit(start.id)
   }
 
-  private commit(recipe: (state: WorkbenchState) => void): void {
+  private commit(label: string, recipe: (state: WorkbenchState) => void): void {
     const current = clone(this.stateSubject.value)
     const next = clone(current)
     recipe(next)
-    this.past.push(current)
-    if (this.past.length > 60) this.past.shift()
-    this.future = []
-    this.stateSubject.next(next)
-    this.updateHistory()
-    this.saveState()
+    if (sameState(current, next)) return
+    const action: JournalAction = { id: `action-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: new Date().toISOString(), label }
+    const nextPast = [...this.past, current].slice(-MAX_HISTORY)
+    const recent = [action, ...this.recent].slice(0, 20)
+    this.runCheckpoint('commit', label, current, next, nextPast, [], recent, action)
+  }
+
+  /**
+   * 执行一轮修改事务：先在内存应用，再走“恢复点 → 主数据 → 闭合”协议。
+   * 落盘失败时内存修改保留，错误横幅提示重试；恢复点已在磁盘上，重开同样可以找回。
+   */
+  private runCheckpoint(
+    kind: 'commit' | 'undo' | 'redo',
+    label: string,
+    before: WorkbenchState,
+    next: WorkbenchState,
+    nextPast: WorkbenchState[],
+    nextFuture: WorkbenchState[],
+    recent?: JournalAction[],
+    action?: JournalAction
+  ): void {
+    const targetRecent = recent ?? this.recent
+    try {
+      const envelope = this.store.checkpoint({
+        kind, action: label, before, next,
+        nextPast: nextPast.slice(-20), nextFuture: nextFuture.slice(-20), recent: targetRecent
+      })
+      this.past = nextPast
+      this.future = nextFuture
+      if (action || recent) this.recent = targetRecent
+      this.stateSubject.next(next)
+      this.savedAtSubject.next(envelope.savedAt)
+      this.saveErrorSubject.next(null)
+      this.updateHistory()
+    } catch (error) {
+      // 即便主数据没写成，恢复点可能已落盘；内存照常应用，保证代理人不丢正在编辑的内容。
+      this.past = nextPast
+      this.future = nextFuture
+      if (action || recent) this.recent = targetRecent
+      this.stateSubject.next(next)
+      this.failSave(error)
+    }
   }
 
   private patchState(recipe: (state: WorkbenchState) => void): void {
     const next = clone(this.stateSubject.value)
     recipe(next)
     this.stateSubject.next(next)
-    this.saveState()
+    try {
+      const envelope = this.store.snapshot(next, this.past.slice(-20), this.future.slice(-20), this.recent)
+      this.savedAtSubject.next(envelope.savedAt)
+      this.saveErrorSubject.next(null)
+    } catch (error) {
+      this.failSave(error)
+    }
+  }
+
+  private failSave(error: unknown): void {
+    this.saveErrorSubject.next(this.describeError(error))
+    this.updateHistory()
+  }
+
+  private describeError(error: unknown): string {
+    if (error instanceof StorageWriteError) return error.message
+    if (error instanceof Error) return `本地保存失败：${error.message}`
+    return '本地保存失败，请检查浏览器存储空间后重试。'
   }
 
   private updateHistory(): void { this.historySubject.next({ past: this.past.length, future: this.future.length }) }
-  private saveState(): void { if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, JSON.stringify(this.stateSubject.value)) }
-  private loadState(): WorkbenchState {
-    if (typeof localStorage === 'undefined') return demoState()
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY)
-      return stored ? { ...demoState(), ...JSON.parse(stored) } : demoState()
-    } catch { return demoState() }
-  }
 }
