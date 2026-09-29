@@ -1,9 +1,19 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
 import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import {
+  MIN_CAP,
+  summarizeState,
+  WorkbenchPersistence,
+  type JournalEnvelope,
+  type PendingRecovery,
+  type RecoveryEntry,
+  type RecoverySummary,
+  type SnapshotEnvelope
+} from './recovery-store'
 
-const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
+const IN_MEMORY_HISTORY_LIMIT = 60
 
 const initialClaims: Claim[] = [
   { id: 'claim-1', number: 1, title: '一种自适应展柜环境控制装置', independent: true, text: '一种自适应展柜环境控制装置，包括：柜体；环境传感模块，设置于所述柜体内并用于采集温湿度数据；以及控制模块，与所述环境传感模块通信，并根据所述温湿度数据调节所述柜体的微环境。' },
@@ -38,16 +48,45 @@ function demoState(): WorkbenchState {
 }
 function clone<T>(value: T): T { return structuredClone(value) }
 
+export interface LastSavedInfo {
+  savedAt: string
+  reason: string
+  /** 磁盘上可恢复的历史轮次数量 */
+  recoveryRounds: number
+}
+
+interface HistoryFrame {
+  state: WorkbenchState
+  /** 该状态在编辑链上的位置；0 为链首，null 表示早于磁盘日志保留范围的边界帧 */
+  seq: number | null
+}
+
 @Injectable({ providedIn: 'root' })
 export class WorkbenchService implements OnDestroy {
-  private readonly initialState = this.loadState()
-  private readonly stateSubject = new BehaviorSubject<WorkbenchState>(this.initialState)
+  private readonly persistence = new WorkbenchPersistence()
+  private readonly bootInfo = this.bootstrap()
+  private readonly stateSubject = new BehaviorSubject<WorkbenchState>(this.bootInfo.state)
   private readonly historySubject = new BehaviorSubject<{ past: number; future: number }>({ past: 0, future: 0 })
-  private past: WorkbenchState[] = []
-  private future: WorkbenchState[] = []
+  private readonly lastSavedSubject = new BehaviorSubject<LastSavedInfo | null>(this.bootInfo.lastSaved)
+  private readonly pendingRecoverySubject = new BehaviorSubject<PendingRecovery | null>(this.bootInfo.pendingRecovery)
+  private readonly storageWarningSubject = new BehaviorSubject<string | null>(null)
+  private readonly migratedLegacySubject = new BehaviorSubject<boolean>(this.bootInfo.migratedLegacy)
+
+  private past: HistoryFrame[] = this.bootInfo.past
+  private future: HistoryFrame[] = this.bootInfo.future
+  /** 已落盘的恢复日志（成功写入磁盘的部分，空间受限时可能被裁剪） */
+  private journalEntries: RecoveryEntry[] = this.bootInfo.journalEntries
+  private nextSeq = this.bootInfo.nextSeq
+  /** 最新快照确认到的日志轮次位置 */
+  private headSeq = this.bootInfo.headSeq
+  private journalMaxSeq = this.bootInfo.journalMaxSeq
 
   readonly state$ = this.stateSubject.asObservable()
   readonly history$ = this.historySubject.asObservable()
+  readonly lastSaved$: Observable<LastSavedInfo | null> = this.lastSavedSubject.asObservable()
+  readonly pendingRecovery$: Observable<PendingRecovery | null> = this.pendingRecoverySubject.asObservable()
+  readonly storageWarning$: Observable<string | null> = this.storageWarningSubject.asObservable()
+  readonly migratedLegacy$: Observable<boolean> = this.migratedLegacySubject.asObservable()
   readonly claims$ = this.state$.pipe(map(state => state.claims))
   readonly paragraphs$ = this.state$.pipe(map(state => state.paragraphs))
   readonly features$ = this.state$.pipe(map(state => state.features))
@@ -58,7 +97,25 @@ export class WorkbenchService implements OnDestroy {
   readonly issues$ = this.state$.pipe(map(state => this.validate(state)))
 
   constructor() {
-    if (typeof window !== 'undefined') window.addEventListener('beforeunload', () => this.savePosition())
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => this.savePosition())
+      // 首次使用（本地没有任何数据）时先落一个空操作快照，保证之后第一次编辑
+      // 即便只写了一半，恢复日志仍能找回初始案件
+      if (!this.persistence.readSnapshot() && this.journalEntries.length === 0) this.seedInitialSnapshot()
+    }
+  }
+
+  private seedInitialSnapshot(): void {
+    const state = clone(this.stateSubject.value)
+    const at = new Date().toISOString()
+    this.headSeq = 0
+    this.journalMaxSeq = 0
+    try {
+      this.persistence.writeSnapshot({ format: 2, savedAt: at, reason: '新建案件', headSeq: 0, journalMaxSeq: 0, state })
+      this.lastSavedSubject.next({ savedAt: at, reason: '新建案件', recoveryRounds: 0 })
+    } catch {
+      // 存储被禁用时保持纯内存运行，后续写入仍会尝试
+    }
   }
 
   ngOnDestroy(): void {
@@ -68,6 +125,7 @@ export class WorkbenchService implements OnDestroy {
   get snapshot(): WorkbenchState { return clone(this.stateSubject.value) }
   get canUndo(): boolean { return this.past.length > 0 }
   get canRedo(): boolean { return this.future.length > 0 }
+  get hasPendingRecovery(): boolean { return this.pendingRecoverySubject.value !== null }
 
   selectClaim(id: string): void {
     this.patchState(state => { state.selectedClaimId = id; state.selectedFeatureId = state.features.find(feature => feature.claimId === id)?.id || null })
@@ -80,7 +138,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   setRole(role: Role): void {
-    this.patchState(state => { state.role = role; state.currentUserRole = role })
+    this.commit('切换角色', state => { state.role = role; state.currentUserRole = role })
   }
 
   setTab(tab: string): void {
@@ -89,14 +147,14 @@ export class WorkbenchService implements OnDestroy {
   }
 
   updateClaim(patch: Partial<Claim>): void {
-    this.commit(state => {
+    this.commit('编辑权利要求', state => {
       const claim = state.claims.find(item => item.id === state.selectedClaimId)
       if (claim) Object.assign(claim, patch)
     })
   }
 
   addClaim(): void {
-    this.commit(state => {
+    this.commit('录入新权利要求', state => {
       const number = Math.max(0, ...state.claims.map(claim => claim.number)) + 1
       const claim: Claim = { id: `claim-${Date.now()}`, number, title: `权利要求 ${number}`, independent: false, text: '请录入权利要求正文。' }
       state.claims.push(claim)
@@ -107,7 +165,7 @@ export class WorkbenchService implements OnDestroy {
 
   addParagraph(): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('新增说明书段落', state => {
       const next = state.paragraphs.length + 1
       state.paragraphs.push({ id: `para-${Date.now()}`, section: `说明书 [${String(next * 5).padStart(4, '0')}]`, text: '' })
     })
@@ -115,7 +173,7 @@ export class WorkbenchService implements OnDestroy {
 
   updateParagraph(id: string, patch: Partial<Paragraph>): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('编辑说明书段落', state => {
       const paragraph = state.paragraphs.find(item => item.id === id)
       if (paragraph) Object.assign(paragraph, patch)
     })
@@ -123,7 +181,7 @@ export class WorkbenchService implements OnDestroy {
 
   deleteParagraph(id: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('删除说明书段落', state => {
       state.paragraphs = state.paragraphs.filter(item => item.id !== id)
       state.features.forEach(feature => { feature.supportIds = feature.supportIds.filter(paragraphId => paragraphId !== id) })
       state.orphanMappings = state.orphanMappings.filter(item => item.paragraphId !== id)
@@ -132,7 +190,7 @@ export class WorkbenchService implements OnDestroy {
 
   addFeature(): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('新增技术特征', state => {
       const feature: Feature = {
         id: `feature-${Date.now()}`, claimId: state.selectedClaimId,
         label: `新特征 ${state.features.filter(item => item.claimId === state.selectedClaimId).length + 1}`,
@@ -145,7 +203,7 @@ export class WorkbenchService implements OnDestroy {
 
   updateFeature(id: string, patch: Partial<Feature>): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('编辑技术特征', state => {
       const feature = state.features.find(item => item.id === id)
       if (feature) Object.assign(feature, patch)
     })
@@ -153,7 +211,7 @@ export class WorkbenchService implements OnDestroy {
 
   deleteFeature(id: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('删除技术特征', state => {
       const feature = state.features.find(item => item.id === id)
       if (!feature) return
       feature.supportIds.forEach(paragraphId => state.orphanMappings.push({
@@ -172,7 +230,7 @@ export class WorkbenchService implements OnDestroy {
 
   toggleParagraphMapping(featureId: string, paragraphId: string): void {
     if (this.stateSubject.value.role === 'viewer') return
-    this.commit(state => {
+    this.commit('更新特征映射', state => {
       const feature = state.features.find(item => item.id === featureId)
       if (!feature) return
       const index = feature.supportIds.indexOf(paragraphId)
@@ -183,7 +241,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   clearOrphan(id: string): void {
-    this.commit(state => { state.orphanMappings = state.orphanMappings.filter(item => item.id !== id) })
+    this.commit('清理遗留映射', state => { state.orphanMappings = state.orphanMappings.filter(item => item.id !== id) })
   }
 
   addAnnotation(featureId: string, text: string): void {
@@ -191,27 +249,27 @@ export class WorkbenchService implements OnDestroy {
     if (!trimmed) return
     const role = this.stateSubject.value.role
     const names: Record<Role, string> = { author: '代理人 · 陈昊', examiner: '审查员 · 李岚', viewer: '观察者' }
-    this.commit(state => state.annotations.push({
+    this.commit('新增批注', state => state.annotations.push({
       id: `annotation-${Date.now()}`, featureId, authorRole: role, authorName: names[role], text: trimmed, updatedAt: new Date().toISOString()
     }))
   }
 
   updateAnnotation(id: string, text: string): void {
-    this.commit(state => {
+    this.commit('编辑批注', state => {
       const annotation = state.annotations.find(item => item.id === id)
       if (annotation && annotation.authorRole === state.role) annotation.text = text
     })
   }
 
   deleteAnnotation(id: string): void {
-    this.commit(state => {
+    this.commit('删除批注', state => {
       const annotation = state.annotations.find(item => item.id === id)
       if (annotation && annotation.authorRole === state.role) state.annotations = state.annotations.filter(item => item.id !== id)
     })
   }
 
   createVersion(name?: string): void {
-    this.commit(state => {
+    this.commit('保存权利要求版本', state => {
       state.versions.unshift({
         id: `version-${Date.now()}`, name: name?.trim() || `快照 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
         createdAt: new Date().toISOString(), claims: clone(state.claims), features: clone(state.features)
@@ -220,7 +278,7 @@ export class WorkbenchService implements OnDestroy {
   }
 
   restoreVersion(id: string): void {
-    this.commit(state => {
+    this.commit('恢复历史版本', state => {
       const version = state.versions.find(item => item.id === id)
       if (!version) return
       state.claims = clone(version.claims)
@@ -233,32 +291,111 @@ export class WorkbenchService implements OnDestroy {
   undo(): void {
     const previous = this.past.pop()
     if (!previous) return
-    this.future.push(clone(this.stateSubject.value))
-    this.stateSubject.next(previous)
+    this.future.unshift({ state: clone(this.stateSubject.value), seq: this.headSeq })
+    this.stateSubject.next(previous.state)
+    this.headSeq = previous.seq ?? this.headSeq
     this.updateHistory()
-    this.saveState()
+    // 只移动快照里的 headSeq 指针，不新增日志轮次
+    this.persistSnapshot('撤销操作')
   }
 
   redo(): void {
-    const next = this.future.pop()
+    const next = this.future.shift()
     if (!next) return
-    this.past.push(clone(this.stateSubject.value))
-    this.stateSubject.next(next)
+    this.past.push({ state: clone(this.stateSubject.value), seq: this.headSeq })
+    this.stateSubject.next(next.state)
+    this.headSeq = next.seq ?? this.headSeq
     this.updateHistory()
-    this.saveState()
+    this.persistSnapshot('重做操作')
+  }
+
+  /** 恢复某一轮（seq）：该轮之后的修改保留为“重做”，撤销/重做从这轮之后继续。 */
+  recoverPending(seq: number): void {
+    const pending = this.pendingRecoverySubject.value
+    const round = pending?.rounds.find(item => item.seq === seq)
+    if (!round) return
+    const entry = this.journalEntries.find(item => item.seq === seq)
+    if (!entry) return
+    const chain = this.reconstructHistory(this.journalEntries, seq, clone(entry.after))
+    if (!chain) return
+    this.past = chain.past
+    this.future = chain.future
+    this.stateSubject.next(clone(entry.after))
+    this.headSeq = seq
+    // 恢复后整段编辑链均已确认，不再重复弹出恢复提示
+    this.journalMaxSeq = Math.max(this.journalMaxSeq, ...this.journalEntries.map(item => item.seq))
+    this.pendingRecoverySubject.next(null)
+    this.updateHistory()
+    this.persistSnapshot(`恢复到「${round.reason}」`)
+  }
+
+  /** 放弃未保存轮次：回到最后一次确认保存的状态。 */
+  discardPending(): void {
+    const pending = this.pendingRecoverySubject.value
+    if (!pending) return
+    if (pending.kind === 'corrupt') {
+      // 已保存数据彻底写坏：放弃意味着用空案件重新开始，日志不再可信
+      const fresh = demoState()
+      this.past = []
+      this.future = []
+      this.journalEntries = []
+      this.nextSeq = 1
+      this.headSeq = 0
+      this.journalMaxSeq = 0
+      this.stateSubject.next(fresh)
+      this.pendingRecoverySubject.next(null)
+      this.persistence.clearJournal()
+      this.updateHistory()
+      this.persistSnapshot('放弃损坏数据并新建案件')
+      return
+    }
+    const confirmedSeq = this.journalMaxSeq
+    this.journalEntries = this.journalEntries.filter(entry => entry.seq <= confirmedSeq)
+    this.persistence.appendJournal(this.journalEntries, this.nextSeq)
+    const snapshot = this.persistence.readSnapshot()
+    const confirmedEntry = this.journalEntries.find(entry => entry.seq === confirmedSeq)
+    const restored = clone(snapshot?.state ?? confirmedEntry?.after ?? demoState())
+    const chain = this.reconstructHistory(this.journalEntries, confirmedSeq, restored)
+    if (chain) this.past = chain.past
+    // 放弃意味着丢弃 head 之后的全部轮次，重做栈必须清空（即使旧日志还没被物理删除）
+    this.future = []
+    this.headSeq = confirmedSeq
+    this.stateSubject.next(restored)
+    this.pendingRecoverySubject.next(null)
+    this.updateHistory()
+    this.persistSnapshot('放弃未保存修改')
+  }
+
+  dismissMigrationNotice(): void {
+    this.migratedLegacySubject.next(false)
+  }
+
+  dismissStorageWarning(): void {
+    this.storageWarningSubject.next(null)
   }
 
   savePosition(): void {
     if (typeof localStorage === 'undefined') return
     const state = this.stateSubject.value
     const position: Position = { tab: state.activeTab, claimId: state.selectedClaimId, featureId: state.selectedFeatureId, scrollY: window.scrollY }
-    localStorage.setItem(POSITION_KEY, JSON.stringify(position))
-    this.saveState()
+    try {
+      localStorage.setItem(POSITION_KEY, JSON.stringify(position))
+    } catch {
+      // 位置无法保存不应影响案件数据
+    }
+    this.persistSnapshot('保存工作位置')
   }
 
   readPosition(): Position {
-    if (typeof localStorage === 'undefined') return { tab: this.initialState.activeTab, claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 }
-    try { return { ...JSON.parse(localStorage.getItem(POSITION_KEY) || '{}'), ...this.stateSubject.value } } catch { return { tab: 'mapping', claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 } }
+    const state = this.stateSubject.value
+    const fallback: Position = { tab: state.activeTab, claimId: state.selectedClaimId, featureId: state.selectedFeatureId, scrollY: 0 }
+    if (typeof localStorage === 'undefined') return fallback
+    try {
+      const stored = JSON.parse(localStorage.getItem(POSITION_KEY) || 'null')
+      return stored ? { ...fallback, ...stored } : fallback
+    } catch {
+      return fallback
+    }
   }
 
   exportJson(): string { return JSON.stringify({ ...this.snapshot, validationIssues: this.validate(this.stateSubject.value) }, null, 2) }
@@ -273,7 +410,7 @@ export class WorkbenchService implements OnDestroy {
     ])
     const csv = [['权利要求', '技术特征', '特征内容', '父级特征', '引用特征', '支持段落'], ...rows]
       .map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n')
-    return `\uFEFF${csv}`
+    return `﻿${csv}`
   }
 
   validate(state = this.stateSubject.value): ValidationIssue[] {
@@ -301,32 +438,251 @@ export class WorkbenchService implements OnDestroy {
     return visit(start.id)
   }
 
-  private commit(recipe: (state: WorkbenchState) => void): void {
-    const current = clone(this.stateSubject.value)
-    const next = clone(current)
-    recipe(next)
-    this.past.push(current)
-    if (this.past.length > 60) this.past.shift()
+  /** 每次数据变更：先在日志里留下本轮“前/后”恢复点，再刷新快照。 */
+  private commit(reason: string, recipe: (state: WorkbenchState) => void): void {
+    const before = clone(this.stateSubject.value)
+    const after = clone(before)
+    recipe(after)
+    const seq = this.nextSeq++
+    const entry: RecoveryEntry = { seq, at: new Date().toISOString(), reason, before, after }
+
+    this.past.push({ state: before, seq: this.headSeq })
+    if (this.past.length > IN_MEMORY_HISTORY_LIMIT) this.past.shift()
     this.future = []
-    this.stateSubject.next(next)
+
+    // 1) 恢复点先落盘（即便随后快照写了一半被关，本轮仍可找回）
+    //    若此前做过撤销，head 之后的旧分支必须从日志截断，避免重开后混入重做栈
+    this.journalEntries = this.journalEntries.filter(entry => entry.seq <= this.headSeq)
+    this.journalEntries.push(entry)
+    const written = this.persistence.appendJournal(this.journalEntries, this.nextSeq)
+    if (written) {
+      this.journalEntries = written.entries
+      this.journalMaxSeq = written.entries.at(-1)?.seq ?? this.journalMaxSeq
+    } else {
+      this.journalEntries = this.journalEntries.slice(-MIN_CAP)
+      this.notifyStorageFailure()
+    }
+
+    // 2) 再写快照并确认
+    this.stateSubject.next(after)
+    this.headSeq = seq
     this.updateHistory()
-    this.saveState()
+    this.persistSnapshot(reason)
   }
 
   private patchState(recipe: (state: WorkbenchState) => void): void {
     const next = clone(this.stateSubject.value)
     recipe(next)
     this.stateSubject.next(next)
-    this.saveState()
   }
 
   private updateHistory(): void { this.historySubject.next({ past: this.past.length, future: this.future.length }) }
-  private saveState(): void { if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, JSON.stringify(this.stateSubject.value)) }
-  private loadState(): WorkbenchState {
-    if (typeof localStorage === 'undefined') return demoState()
+
+  /**
+   * 把恢复日志视为一条“编辑链”：每轮 before 必须与上一轮 after 相同。
+   * head 之前的帧构成撤销栈，head 之后（如中断未确认的轮次）构成重做栈。
+   * 链在任何位置断裂（旧数据/裁剪/写坏）就只从断点之后重建，绝不串档。
+   */
+  private reconstructHistory(
+    entries: RecoveryEntry[],
+    headSeq: number,
+    headState: WorkbenchState
+  ): { past: HistoryFrame[]; future: HistoryFrame[] } | null {
+    const chain = entries.slice().sort((a, b) => a.seq - b.seq)
+    const headIndex = chain.findIndex(entry => entry.seq === headSeq)
+    if (headIndex === -1) return null
+    const headEntry = chain[headIndex]
+
+    // head 状态必须与日志中该轮的 after 一致（或撤销状态下与后一轮的 before 一致）
+    const chainHeadState = headEntry.after
+    if (JSON.stringify(chainHeadState) !== JSON.stringify(headState)) return null
+
+    // 向前收集连续帧
+    const past: HistoryFrame[] = []
+    let oldestIndex = headIndex
+    let cursor = headEntry.before
+    for (let i = headIndex - 1; i >= 0; i--) {
+      const entry = chain[i]
+      if (JSON.stringify(entry.after) !== JSON.stringify(cursor)) break
+      past.unshift({ state: clone(entry.after), seq: entry.seq })
+      cursor = entry.before
+      oldestIndex = i
+    }
+    // 栈底：链首之前（seq=0），或日志保留范围之外的边界（最早轮次的前一位置）
+    if (oldestIndex === 0) {
+      past.unshift({ state: clone(chain[0].before), seq: 0 })
+    } else {
+      const boundarySeq = chain[oldestIndex].seq - 1
+      past.unshift({ state: clone(cursor), seq: boundarySeq })
+    }
+
+    // 向后收集可重做帧（要求链连续到 head）
+    const future: HistoryFrame[] = []
+    let forwardCursor = headEntry.after
+    for (let i = headIndex + 1; i < chain.length; i++) {
+      const entry = chain[i]
+      if (JSON.stringify(entry.before) !== JSON.stringify(forwardCursor)) break
+      future.push({ state: clone(entry.after), seq: entry.seq })
+      forwardCursor = entry.after
+    }
+    if (past.length > IN_MEMORY_HISTORY_LIMIT) past.splice(0, past.length - IN_MEMORY_HISTORY_LIMIT)
+    return { past, future }
+  }
+
+  /** 双槽原子写快照：写坏/写一半都不会覆盖当前已确认案件。 */
+  private persistSnapshot(reason: string): void {
+    if (typeof localStorage === 'undefined') return
+    const envelope: SnapshotEnvelope = {
+      format: 2,
+      savedAt: new Date().toISOString(),
+      reason,
+      headSeq: this.headSeq,
+      journalMaxSeq: this.journalMaxSeq,
+      state: clone(this.stateSubject.value)
+    }
     try {
-      const stored = localStorage.getItem(STORAGE_KEY)
-      return stored ? { ...demoState(), ...JSON.parse(stored) } : demoState()
-    } catch { return demoState() }
+      this.persistence.writeSnapshot(envelope)
+      this.lastSavedSubject.next({ savedAt: envelope.savedAt, reason, recoveryRounds: this.journalEntries.length })
+    } catch {
+      this.notifyStorageFailure()
+    }
+  }
+
+  private notifyStorageFailure(): void {
+    this.storageWarningSubject.next('本地存储空间不足或不可用，自动保存未能完整写入。请立即导出 JSON 备份后清理浏览器存储。')
+  }
+
+  // ---------------------------------------------------------------------------
+  // 启动恢复
+  // ---------------------------------------------------------------------------
+
+  private bootstrap(): {
+    state: WorkbenchState
+    past: HistoryFrame[]
+    future: HistoryFrame[]
+    journalEntries: RecoveryEntry[]
+    nextSeq: number
+    headSeq: number
+    journalMaxSeq: number
+    lastSaved: LastSavedInfo | null
+    pendingRecovery: PendingRecovery | null
+    migratedLegacy: boolean
+  } {
+    if (typeof localStorage === 'undefined') {
+      return this.freshBoot()
+    }
+
+    // 1) 旧格式（v1）第一次打开自动接入：转成新快照 + 初始恢复点
+    const legacy = this.persistence.legacyExists() ? this.persistence.readLegacyState() : null
+    const snapshot = this.persistence.readSnapshot()
+    if (legacy && !snapshot) {
+      const state = clone(legacy)
+      const journal: JournalEnvelope = { format: 2, nextSeq: 2, entries: [{ seq: 1, at: new Date().toISOString(), reason: '接入旧版本地数据', before: demoState(), after: state }] }
+      try {
+        this.persistence.appendJournal(journal.entries, 2)
+        this.persistence.writeSnapshot({ format: 2, savedAt: new Date().toISOString(), reason: '旧版本地数据已接入', headSeq: 1, journalMaxSeq: 1, state: clone(state) })
+        this.persistence.removeLegacyState()
+        return {
+          state, past: [{ state: demoState(), seq: 0 }], future: [], journalEntries: journal.entries, nextSeq: 2,
+          headSeq: 1, journalMaxSeq: 1,
+          lastSaved: { savedAt: new Date().toISOString(), reason: '旧版本地数据已接入', recoveryRounds: 1 },
+          pendingRecovery: null, migratedLegacy: true
+        }
+      } catch {
+        // 迁移落盘失败：本次会话仍使用旧数据，但保留 v1 键以便下次重试
+        return {
+          state, past: [], future: [], journalEntries: [], nextSeq: 1, headSeq: 0, journalMaxSeq: 0,
+          lastSaved: null, pendingRecovery: null, migratedLegacy: true
+        }
+      }
+    }
+    // 已在 v2 体系下运行后，旧键只作残留清理
+    if (snapshot && this.persistence.legacyExists()) this.persistence.removeLegacyState()
+
+    const journal = this.persistence.readJournal()
+    const journalEntries = journal.entries
+    const nextSeq = journal.nextSeq
+    const corrupt = this.persistence.snapshotCorrupt()
+
+    // 2) 没有任何可用数据：演示数据开局
+    if (!snapshot) {
+      if (corrupt && journalEntries.length) {
+        // 快照两个槽都写坏，但恢复日志还在 —— 从日志兜底
+        const latest = journalEntries.at(-1)!
+        const chain = this.reconstructHistory(journalEntries, latest.seq, clone(latest.after)) ?? { past: [], future: [] }
+        return {
+          ...this.externalBase(latest.after, chain, journalEntries, nextSeq, latest.seq, latest.seq),
+          lastSaved: { savedAt: latest.at, reason: '从恢复日志找回', recoveryRounds: journalEntries.length },
+          pendingRecovery: this.buildCorruptRecovery(journalEntries),
+          migratedLegacy: false
+        }
+      }
+      return this.freshBoot()
+    }
+
+    // 3) 快照可读：按 headSeq 在编辑链上重建撤销/重做
+    const headSeq = snapshot.headSeq
+    const journalMaxSeq = Math.max(snapshot.journalMaxSeq, journalEntries.at(-1)?.seq ?? 0)
+    let built: { past: HistoryFrame[]; future: HistoryFrame[] }
+    if (headSeq === 0 && journalEntries.length === 0) {
+      built = { past: [], future: [] }
+    } else if (headSeq === 0) {
+      // 撤销到链首但日志仍在：整条链都是重做
+      built = { past: [], future: journalEntries.slice().sort((a, b) => a.seq - b.seq).map(entry => ({ state: clone(entry.after), seq: entry.seq })) }
+    } else {
+      built = this.reconstructHistory(journalEntries, headSeq, clone(snapshot.state))
+        ?? { past: [], future: [] }
+    }
+    const base = this.externalBase(snapshot.state, built, journalEntries, nextSeq, headSeq, journalMaxSeq)
+    const lastSaved: LastSavedInfo = { savedAt: snapshot.savedAt, reason: snapshot.reason, recoveryRounds: journalEntries.length }
+
+    const unconfirmed = journalEntries.filter(entry => entry.seq > snapshot.journalMaxSeq)
+    const pendingRecovery = unconfirmed.length
+      ? {
+        kind: 'interrupted' as const,
+        title: '检测到未完成的自动保存',
+        detail: '浏览器上次是在自动保存过程中关闭的。最后一次确认保存完好，下面这些修改轮次已在恢复日志中找回，可以恢复或放弃。',
+        rounds: unconfirmed.slice().reverse().map(entry => this.roundInfo(entry))
+      }
+      : null
+
+    return { ...base, lastSaved, pendingRecovery, migratedLegacy: false }
+  }
+
+  private externalBase(
+    state: WorkbenchState,
+    built: { past: HistoryFrame[]; future: HistoryFrame[] },
+    journalEntries: RecoveryEntry[],
+    nextSeq: number,
+    headSeq: number,
+    journalMaxSeq: number
+  ) {
+    return {
+      state: clone(state), past: built.past, future: built.future,
+      journalEntries, nextSeq, headSeq, journalMaxSeq,
+      lastSaved: null as LastSavedInfo | null, pendingRecovery: null as PendingRecovery | null, migratedLegacy: false
+    }
+  }
+
+  private roundInfo(entry: RecoveryEntry) {
+    const summary: RecoverySummary = summarizeState(entry.after, entry.at, entry.reason, entry.seq)
+    return { seq: entry.seq, at: entry.at, reason: entry.reason, summary }
+  }
+
+  private buildCorruptRecovery(entries: RecoveryEntry[]): PendingRecovery {
+    return {
+      kind: 'corrupt',
+      title: '已保存数据损坏，已从恢复日志找回',
+      detail: '本地案件快照未能读取（可能在写入时被关闭或存储被改写）。当前展示的是恢复日志中最新一轮的内容，请确认后保留为新的案件，或放弃后从空案件重新开始。',
+      rounds: entries.slice().reverse().map(entry => this.roundInfo(entry))
+    }
+  }
+
+  private freshBoot() {
+    return {
+      state: demoState(), past: [] as HistoryFrame[], future: [] as HistoryFrame[],
+      journalEntries: [] as RecoveryEntry[], nextSeq: 1, headSeq: 0, journalMaxSeq: 0,
+      lastSaved: null, pendingRecovery: null, migratedLegacy: false
+    }
   }
 }

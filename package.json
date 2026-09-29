@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "start": "ng serve --host 0.0.0.0 --port 4200",
-    "build": "ng build --configuration production"
+    "build": "ng build --configuration production",
+    "test:recovery": "node test-recovery.js"
   },
   "dependencies": {
     "@angular/common": "19.2.25",

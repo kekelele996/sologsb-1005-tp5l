@@ -11,7 +11,8 @@ import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
 import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
-import { WorkbenchService } from './workbench.service'
+import { type LastSavedInfo, WorkbenchService } from './workbench.service'
+import type { PendingRecovery } from './recovery-store'
 
 @Component({
   selector: 'app-root',
@@ -30,6 +31,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   versionDialog = false
   versionName = ''
   activeIssue: ValidationIssue | null = null
+  pendingRecovery: PendingRecovery | null = null
+  selectedRecoverySeq: number | null = null
+  lastSaved: LastSavedInfo | null = null
+  storageWarning: string | null = null
+  migratedLegacy = false
   roleOptions: Array<{ label: string; value: Role }> = [
     { label: '代理人（可编辑主数据与本人批注）', value: 'author' },
     { label: '审查员（可编辑本人批注）', value: 'examiner' },
@@ -48,6 +54,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }))
     this.subscriptions.add(this.service.issues$.subscribe(issues => this.issues = issues))
     this.subscriptions.add(this.service.history$.subscribe(history => this.history = history))
+    this.subscriptions.add(this.service.pendingRecovery$.subscribe(pending => {
+      this.pendingRecovery = pending
+      this.selectedRecoverySeq = pending?.rounds[0]?.seq ?? null
+    }))
+    this.subscriptions.add(this.service.lastSaved$.subscribe(info => this.lastSaved = info))
+    this.subscriptions.add(this.service.storageWarning$.subscribe(message => this.storageWarning = message))
+    this.subscriptions.add(this.service.migratedLegacy$.subscribe(migrated => this.migratedLegacy = migrated))
     window.addEventListener('keydown', this.handleKeyboard)
   }
 
@@ -153,6 +166,34 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   closeIssue(): void { this.activeIssue = null }
+
+  get selectedRecoveryRound() {
+    return this.pendingRecovery?.rounds.find(round => round.seq === this.selectedRecoverySeq) || this.pendingRecovery?.rounds[0] || null
+  }
+
+  get lastSavedLabel(): string {
+    if (!this.lastSaved) return '尚未保存'
+    const time = new Date(this.lastSaved.savedAt).toLocaleString('zh-CN', { hour12: false })
+    return `已保存 ${time} · ${this.lastSaved.reason}`
+  }
+
+  confirmRecovery(): void {
+    const seq = this.selectedRecoverySeq ?? this.pendingRecovery?.rounds[0]?.seq
+    if (seq === undefined) return
+    this.service.recoverPending(seq)
+  }
+
+  abandonRecovery(): void {
+    if (!this.pendingRecovery) return
+    const message = this.pendingRecovery.kind === 'corrupt'
+      ? '确定放弃找回的案件内容吗？将清空本地数据并从空案件重新开始，此操作不可撤销。'
+      : '确定放弃未保存的修改轮次吗？将回到最后一次确认保存的状态。'
+    if (typeof window !== 'undefined' && !window.confirm(message)) return
+    this.service.discardPending()
+  }
+
+  dismissMigrationNotice(): void { this.service.dismissMigrationNotice() }
+  dismissStorageWarning(): void { this.service.dismissStorageWarning() }
 
   private syncVersions(): void {
     if (!this.state.versions.some(item => item.id === this.compareA)) this.compareA = this.state.versions[1]?.id || this.state.versions[0]?.id || ''

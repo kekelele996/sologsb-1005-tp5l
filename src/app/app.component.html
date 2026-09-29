@@ -6,12 +6,24 @@
       <div><strong>权利要求映射工作台</strong><small>Claim-to-Spec Traceability</small></div>
     </div>
     <div class="top-actions">
-      <span class="save-state">浏览器本地自动保存</span>
+      <span class="save-state" [title]="lastSavedLabel"><i class="pi pi-database"></i>{{ lastSavedLabel }}</span>
       <p-button label="撤销" icon="pi pi-undo" severity="secondary" [outlined]="true" [disabled]="!history.past" (onClick)="service.undo()" pTooltip="Ctrl / ⌘ + Z"></p-button>
       <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" [disabled]="!history.future" (onClick)="service.redo()" pTooltip="Ctrl / ⌘ + Shift + Z"></p-button>
       <p-button label="保存版本" icon="pi pi-save" (onClick)="versionDialog = true" pTooltip="Ctrl / ⌘ + S"></p-button>
     </div>
   </header>
+
+  <div class="notice-banner migrated" *ngIf="migratedLegacy">
+    <i class="pi pi-refresh"></i>
+    <span>已自动接入旧版本地数据并转为可恢复日志，之后每次修改都会先留恢复点再保存。</span>
+    <button type="button" (click)="dismissMigrationNotice()" aria-label="关闭提示"><i class="pi pi-times"></i></button>
+  </div>
+  <div class="notice-banner storage-error" *ngIf="storageWarning">
+    <i class="pi pi-exclamation-triangle"></i>
+    <span>{{ storageWarning }}</span>
+    <button type="button" (click)="exportFile('json')"><i class="pi pi-download"></i>立即导出 JSON</button>
+    <button type="button" (click)="dismissStorageWarning()" aria-label="关闭提示"><i class="pi pi-times"></i></button>
+  </div>
 
   <main id="workbench" class="workbench">
     <aside class="case-sidebar">
@@ -253,4 +265,63 @@
     <p>{{ issue.detail }}</p>
   </div>
   <ng-template pTemplate="footer"><p-button label="关闭" (onClick)="closeIssue()" /></ng-template>
+</p-dialog>
+
+<p-dialog [header]="pendingRecovery?.title || '恢复未保存的工作'" [visible]="!!pendingRecovery" [modal]="true" [closable]="false" [draggable]="false" [style]="{ width: '640px' }">
+  <div class="dialog-body recovery-dialog" *ngIf="pendingRecovery as pending">
+    <p class="recovery-intro">
+      <i class="pi" [class.pi-history]="pending.kind === 'interrupted'" [class.pi-shield]="pending.kind === 'corrupt'"></i>{{ pending.detail }}
+    </p>
+
+    <div class="recovery-rounds">
+      <button type="button" class="recovery-round" *ngFor="let round of pending.rounds" [class.selected]="round.seq === selectedRecoverySeq" (click)="selectedRecoverySeq = round.seq">
+        <span class="round-radio"><i class="pi" [class.pi-circle]="round.seq !== selectedRecoverySeq" [class.pi-check-circle]="round.seq === selectedRecoverySeq"></i></span>
+        <span class="round-main">
+          <strong>{{ round.reason }}</strong>
+          <small>{{ round.at | date:'yyyy-MM-dd HH:mm:ss' }} · 第 {{ round.seq }} 轮修改</small>
+        </span>
+        <span class="round-counts">
+          <b>{{ round.summary.claims }} 项权利要求</b>
+          <b>{{ round.summary.features }} 个特征 / {{ round.summary.mappings }} 条映射</b>
+          <b>{{ round.summary.annotations }} 条批注</b>
+          <b>{{ round.summary.versions }} 个版本</b>
+        </span>
+      </button>
+    </div>
+
+    <div class="recovery-detail" *ngIf="selectedRecoveryRound as round">
+      <h3>恢复后将找回以下内容</h3>
+      <div class="recovery-metrics">
+        <div><strong>{{ round.summary.claims }}</strong><span>权利要求</span></div>
+        <div><strong>{{ round.summary.features }}</strong><span>技术特征</span></div>
+        <div><strong>{{ round.summary.mappings }}</strong><span>特征映射</span></div>
+        <div><strong>{{ round.summary.annotations }}</strong><span>批注</span></div>
+        <div><strong>{{ round.summary.versions }}</strong><span>版本</span></div>
+      </div>
+      <div class="recovery-lists">
+        <div>
+          <h4>权利要求</h4>
+          <ul *ngIf="round.summary.claimTitles.length; else noClaims">
+            <li *ngFor="let title of round.summary.claimTitles">{{ title }}</li>
+            <li *ngIf="round.summary.claims > round.summary.claimTitles.length">…等 {{ round.summary.claims }} 项</li>
+          </ul>
+          <ng-template #noClaims><p class="empty-note">（暂无权利要求）</p></ng-template>
+        </div>
+        <div>
+          <h4>已保存版本</h4>
+          <ul *ngIf="round.summary.versionNames.length; else noVersions">
+            <li *ngFor="let name of round.summary.versionNames">{{ name }}</li>
+            <li *ngIf="round.summary.versions > round.summary.versionNames.length">…等 {{ round.summary.versions }} 个</li>
+          </ul>
+          <ng-template #noVersions><p class="empty-note">（尚未保存版本快照）</p></ng-template>
+        </div>
+      </div>
+      <p class="recovery-hint" *ngIf="pending.kind === 'interrupted'">恢复后撤销/重做将从这一轮之后继续：可继续撤销更早的修改，或重做这轮之后被找回的轮次。</p>
+      <p class="recovery-hint danger" *ngIf="pending.kind === 'corrupt'">当前已保存快照无法读取；恢复会把所选轮次另存为新的完好快照。</p>
+    </div>
+  </div>
+  <ng-template pTemplate="footer">
+    <p-button label="放弃这些修改" icon="pi pi-trash" severity="danger" [outlined]="true" (onClick)="abandonRecovery()" />
+    <p-button [label]="pendingRecovery?.kind === 'corrupt' ? '找回并另存为当前案件' : '恢复选中轮次'" icon="pi pi-history" (onClick)="confirmRecovery()" />
+  </ng-template>
 </p-dialog>
